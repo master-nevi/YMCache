@@ -96,7 +96,7 @@ static NSString *const kYFCachePersistenceErrorDomain = @"YFCachePersistenceErro
     // A) With a change check: 10s after the first call, 5s after the second call – second caller is confused
     // B) Without a change check: 20s after the first call, 10s after the second call – first caller is confused
     
-    dispatch_sync(self.updateQueue, ^{
+    dispatch_async(self.updateQueue, ^{
         self->_saveInterval = saveInterval;
         
         // Invalidate existing source timer.

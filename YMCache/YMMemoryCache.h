@@ -57,6 +57,11 @@ typedef BOOL(^YMMemoryCacheEvictionDecider)(id key, id value, void *__nullable c
 /** Unique name identifying this cache, for example, in log messages. */
 @property (nonatomic, readonly, nullable) NSString *name;
 
+/** The target mutual exclusion GCD queue provided during initialization, or
+ *  nil if none was provided.
+ */
+@property (nonatomic, readonly, nullable) dispatch_queue_t targetQueue;
+
 /** Maximum amount of time between evictions checks. Evictions may occur at any time up to this value.
  * Defaults to 600 seconds, or 10 minutes.
  */
@@ -98,6 +103,25 @@ typedef BOOL(^YMMemoryCacheEvictionDecider)(id key, id value, void *__nullable c
  */
 - (instancetype)initWithName:(nullable NSString *)name
              evictionDecider:(nullable YMMemoryCacheEvictionDecider)evictionDecider NS_DESIGNATED_INITIALIZER;
+
+/** Initializes a newly allocated memory cache using the specified cache name, delegate & queue.
+ * @param name (Optional) A unique name for this cache. Helpful for debugging.
+ * @param targetQueue (Optional) If provided, the target queue for YMCache's internal
+ *  synchronization and work queues to use. This parameter is used to provide YMCache
+ *  with a mutual exclusion queue, effectively joining a GCD queue heirarcy
+ *  (See WWDC 2017 Session 706) which can provide significant performance optimizations
+ *  when YMCache is typically heavily accessed from a particular set of persistent
+ *  queues. If nil, YMCache will not specify a target queue when creating it's queues.
+ * @param evictionDecider (Optional) A block used to decide if an item (a key-value pair) is evictable.
+ *  Clients return YES if the item can be evicted, or NO if the item should not be evicted from the cache.
+ *  A nil evictionDevider is equivalent to returning NO for all items. The decider will execute on an
+ *  arbitrary thread. The `context` parameter is NULL if the block is called due to the internal eviction
+ *  timer expiring.
+ * @return An initialized memory cache using name, delegate and delegateQueue.
+ */
+- (instancetype)initWithName:(nullable NSString *)name
+                 targetQueue:(nullable dispatch_queue_t)targetQueue
+             evictionDecider:(nullable YMMemoryCacheEvictionDecider)evictionDecider;
 
 /** Returns the value associated with a given key.
  * @param key The key for which to return the corresponding value.

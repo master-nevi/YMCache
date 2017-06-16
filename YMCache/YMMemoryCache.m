@@ -3,12 +3,23 @@
 //  Licensed under the terms of the MIT License. See LICENSE file in the project root.
 
 #import "YMMemoryCache.h"
+#import <os/lock.h>
+
+//#if defined(__MAC_10_12) || defined(__IPHONE_10_0) || defined(__WATCHOS_3_0) || defined(__TVOS_10_0)
+//    #import <sys/kdebug_signpost.h>
+//#else
+//    #define kdebug_signpost(...) do {} while(0);
+//    #define kdebug_signpost_start(...) do {} while(0);
+//    #define kdebug_signpost_end(...) do {} while(0);
+//#endif
 
 #define AssertPrivateQueue \
 NSAssert(dispatch_get_specific(kYFPrivateQueueKey) == (__bridge void *)self, @"Wrong Queue")
 
 #define AssertNotPrivateQueue \
 NSAssert(dispatch_get_specific(kYFPrivateQueueKey) != (__bridge void *)self, @"Potential deadlock: blocking call issued from current queue, to current queue")
+
+#define IsPrivateQueue (dispatch_get_specific(kYFPrivateQueueKey) == (__bridge void *)self)
 
 NSString *const kYFCacheDidChangeNotification = @"kYFCacheDidChangeNotification";
 NSString *const kYFCacheUpdatedItemsUserInfoKey = @"kYFCacheUpdatedItemsUserInfoKey";
@@ -30,9 +41,12 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 
 @property (nonatomic, copy) YMMemoryCacheEvictionDecider evictionDecider;
 @property (nonatomic) dispatch_queue_t evictionDeciderQueue;
+
 @end
 
-@implementation YMMemoryCache
+@implementation YMMemoryCache {
+    os_unfair_lock _unfairLock;
+}
 
 #pragma mark - Lifecycle
 
@@ -45,6 +59,11 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 }
 
 - (instancetype)initWithName:(NSString *)cacheName evictionDecider:(YMMemoryCacheEvictionDecider)evictionDecider {
+    return [self initWithName:cacheName targetQueue:nil evictionDecider:evictionDecider];
+}
+
+- (instancetype)initWithName:(NSString *)cacheName targetQueue:(nullable dispatch_queue_t)targetQueue
+             evictionDecider:(YMMemoryCacheEvictionDecider)evictionDecider {
     
     if (self = [super init]) {
         
@@ -53,13 +72,16 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
             _name = cacheName;
             queueName = [queueName stringByAppendingFormat:@" %@", cacheName];
         }
-        _queue = dispatch_queue_create([queueName UTF8String], DISPATCH_QUEUE_CONCURRENT);
+        
+        _queue = dispatch_queue_create_with_target(queueName.UTF8String, DISPATCH_QUEUE_CONCURRENT, targetQueue);
         dispatch_queue_set_specific(_queue, kYFPrivateQueueKey, (__bridge void *)self, NULL);
+        
+        _unfairLock = OS_UNFAIR_LOCK_INIT;
         
         if (evictionDecider) {
             _evictionDecider = evictionDecider;
             NSString *evictionQueueName = [queueName stringByAppendingString:@" (eviction)"];
-            _evictionDeciderQueue = dispatch_queue_create([evictionQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
+            _evictionDeciderQueue = dispatch_queue_create_with_target(evictionQueueName.UTF8String, DISPATCH_QUEUE_SERIAL, targetQueue);
             
             // Time interval to notify UI. This sets the overall update cadence for the app.
             [self setEvictionInterval:600.0];
@@ -90,22 +112,23 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 #pragma mark - Persistence
 
 - (void)addEntriesFromDictionary:(NSDictionary *)dictionary {
-    dispatch_barrier_async(self.queue, ^{
-        [self.items addEntriesFromDictionary:dictionary];
-        [self.updatedPendingNotify addEntriesFromDictionary:dictionary];
+    os_unfair_lock_lock(&_unfairLock);
+    [self.items addEntriesFromDictionary:dictionary];
+    os_unfair_lock_unlock(&_unfairLock);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.queue, ^{
+        [weakSelf.updatedPendingNotify addEntriesFromDictionary:dictionary];
         for (id key in dictionary) {
-            [self.removedPendingNotify removeObject:key];
+            [weakSelf.removedPendingNotify removeObject:key];
         }
     });
 }
 
 - (NSDictionary *)allItems {
-    AssertNotPrivateQueue;
-    
-    __block NSDictionary *items;
-    dispatch_sync(self.queue, ^{
-        items = [self.items copy];
-    });
+    os_unfair_lock_lock(&_unfairLock);
+    NSDictionary *items = [self.items copy];
+    os_unfair_lock_unlock(&_unfairLock);
     
     return items;
 }
@@ -142,7 +165,7 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 }
 
 - (void)setNotificationInterval:(NSTimeInterval)notificationInterval {
-
+    
     dispatch_barrier_async(self.queue, ^{
         self->_notificationInterval = notificationInterval;
         
@@ -179,30 +202,34 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 #pragma mark - Keyed Subscripting
 
 - (id)objectForKeyedSubscript:(id)key {
-    AssertNotPrivateQueue;
-    
-    __block id item;
-    dispatch_sync(self.queue, ^{
-        item = self.items[key];
-    });
+    os_unfair_lock_lock(&_unfairLock);
+    id item = self.items[key];
+    os_unfair_lock_unlock(&_unfairLock);
     return item;
 }
 
 - (void)setObject:(id)obj forKeyedSubscript:(id)key {
     NSParameterAssert(key); // The collections will assert, but fail earlier to aid in async debugging
+    if (!key) {
+        return;
+    }
     
-    __weak __typeof(self) weakSelf = self;
-    dispatch_barrier_async(self.queue, ^{
-        __strong __typeof(self) strongSelf = weakSelf;
-        
+    os_unfair_lock_lock(&_unfairLock);
+    if (obj) {
+        self.items[key] = obj;
+    } else { // removing existing key if nil was passed in
+        [self.items removeObjectForKey:key];
+    }
+    os_unfair_lock_unlock(&_unfairLock);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.queue, ^{
         if (obj) {
-            [strongSelf.removedPendingNotify removeObject:key];
-            strongSelf.items[key] = obj;
-            strongSelf.updatedPendingNotify[key] = obj;
-        } else if (strongSelf.items[key]) { // removing existing key
-            [strongSelf.removedPendingNotify addObject:key];
-            [strongSelf.items removeObjectForKey:key];
-            [strongSelf.updatedPendingNotify removeObjectForKey:key];
+            [weakSelf.removedPendingNotify removeObject:key];
+            weakSelf.updatedPendingNotify[key] = obj;
+        } else {
+            [weakSelf.removedPendingNotify addObject:key];
+            [weakSelf.updatedPendingNotify removeObjectForKey:key];
         }
     });
 }
@@ -210,33 +237,33 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 #pragma mark - Key-Value Management
 
 - (void)removeAllObjects {
-    AssertNotPrivateQueue;
+    os_unfair_lock_lock(&_unfairLock);
+    NSDictionary *items = self.items;
+    self.items = [NSMutableDictionary new];
+    os_unfair_lock_unlock(&_unfairLock);
     
-    dispatch_barrier_sync(self.queue, ^{
-        for (id key in self.items) {
-            [self.updatedPendingNotify removeObjectForKey:key];
-            [self.removedPendingNotify addObject:key];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.queue, ^{
+        for (id key in items) {
+            [weakSelf.updatedPendingNotify removeObjectForKey:key];
+            [weakSelf.removedPendingNotify addObject:key];
         }
-        
-        [self.items removeAllObjects];
     });
 }
 
 - (void)removeObjectsForKeys:(NSArray *)keys {
-    AssertNotPrivateQueue;
-    
     if (!keys.count) {
         return;
     }
     
-    dispatch_barrier_sync(self.queue, ^{
-        for (id key in keys) {
-            if (self.items[key]) {
-                [self.removedPendingNotify addObject:key];
-                [self.updatedPendingNotify removeObjectForKey:key];
-                [self.items removeObjectForKey:key];
-            }
-        }
+    os_unfair_lock_lock(&_unfairLock);
+    [self.items removeObjectsForKeys:keys];
+    os_unfair_lock_unlock(&_unfairLock);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.queue, ^{
+        [weakSelf.removedPendingNotify addObjectsFromArray:keys];
+        [weakSelf.updatedPendingNotify removeObjectsForKeys:keys];
     });
 }
 
@@ -252,7 +279,7 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
     }
     self.updatedPendingNotify = [NSMutableDictionary dictionary];
     self.removedPendingNotify = [NSMutableSet set];
-
+    
     dispatch_async(dispatch_get_main_queue(), ^{ // does not require a barrier since setObject: is the only other mutator
         [[NSNotificationCenter defaultCenter] postNotificationName:kYFCacheDidChangeNotification
                                                             object:self
@@ -266,7 +293,7 @@ static const CFStringRef kYFPrivateQueueKey = CFSTR("kYFPrivateQueueKey");
 - (void)purgeEvictableItems:(void *)context {
     // All external execution must have been dispatched to another queue so as to not leak the private queue
     // though the user-provided evictionDecider block.
-    AssertNotPrivateQueue;
+    //AssertNotPrivateQueue;
     
     // Don't clean up if no expiration decider block
     if (!self.evictionDecider) {
